@@ -1,241 +1,239 @@
-# VL-Calibration Comp2 Project
+# VL-Calibration Visual-Certainty Kernel
 
-This repository sets up a reproducible local development environment for experimenting with the VL-Calibration dataset and preparing GPU-side experiments for the Computing for Data Science 2 final project.
+GPU optimization project for **Computing for Data Science 2**. We take the
+**token entropy** and **KL-divergence** computations that define VL-Calibration's
+intrinsic visual certainty and benchmark three implementations of the dense,
+memory-bound `[T, V]` kernel they reduce to:
 
-The current goal is to do as much development as possible locally, then use the GPU server only for GPU-dependent execution, profiling, benchmarking, and final analysis.
+1. **Eager** (naive multi-pass PyTorch) — the baseline.
+2. **torch.compile** — same source, Inductor fuses the passes.
+3. **Fused Triton** — single streaming pass (added separately).
 
-## Project Goal
+We profile all three (Nsight), validate numerical agreement, and place them on a
+roofline to show fusion cutting DRAM traffic.
 
-This project explores the VL-Calibration pipeline around decoupled visual and reasoning confidence for large vision-language models. The immediate engineering goal is to build a clean, reproducible pipeline that can:
+---
 
-1. Download and organize the VL-Calibration-12K dataset.
-2. Verify the raw dataset schema.
-3. Convert the raw dataset into a pipeline-friendly format.
-4. Run local smoke tests without requiring a GPU.
-5. Recreate the same environment later on a GPU server.
-6. Extend the pipeline to generate model responses, visual entropy, visual KL, and related fields required by later training or analysis scripts.
+## Baseline provenance (read this — it makes the project honest)
 
-## Repository Structure
+The upstream VL-Calibration paper (arXiv:2604.09529) defines visual certainty as
+two logit-level quantities over the vocabulary `V`:
 
-```text
-vl-calib-comp2/
-  configs/
-  data/
-    raw/
-    debug/
-    processed/
-    modelscope/
-  logs/
-  results/
+- **Internal certainty (entropy):** `H_t = -Σ_v p_t[v] log p_t[v]`, `p = softmax(logits_orig[t])`
+- **Visual grounding (KL):** `KL_t = Σ_v p_t[v] (log p_t[v] - log q_t[v])`,
+  `p = softmax(logits_orig[t])`, `q = softmax(logits_pert[t])` where the perturbed
+  distribution comes from a perturbed input image.
+
+In the released pipeline these are **collapsed to per-token scalars upstream**
+(`log_probs_from_logits` in `dp_actor.py`), and `decouple.py` only shuffles those
+scalars — no dense `[T, V]` tensor survives, so there is nothing GPU-relevant to
+profile there. **We therefore reconstruct and benchmark the dense `[T, V]`
+formulation the metric is mathematically defined on**, since that is the
+memory-bound kernel worth fusing. All three arms compute exactly the same math on
+identical inputs for an apples-to-apples comparison. State this plainly in the
+report; do not imply we optimized a pre-existing GPU kernel from the repo.
+
+---
+
+## The data: you GENERATE it, you don't download it
+
+The dense `[T, V]` logits never exist on disk in any dataset — they are transient
+generation-time tensors. The `train_*_pipeline.jsonl` file only has
+`problem / answer / ground_truth / images` plus **null placeholder** fields
+(`response`, `vision_entropy`, `vision_kl`, ...). So the benchmark input is
+produced by us, in two tiers:
+
+- **Tier 1 — synthetic logits (PRIMARY benchmark).** `scripts/gen_synthetic.py`
+  makes `[T, V]` logit pairs at the model's real vocab with realistic peakiness.
+  A roofline study depends on tensor shape/dtype, not semantic content. Fully
+  reproducible from a seed → **not committed to git**, regenerated on demand.
+- **Tier 2 — real logits (correctness/realism anchor).** `scripts/dump_real_logits.py`
+  runs the real VLM on ~16 samples (original + perturbed image) and dumps `[T, V]`
+  logits. Proves the kernel gives sane entropy/KL on real data. GPU + weights
+  required. Large → **not committed to git**.
+
+The only data file committed is `data/real/train_32_pipeline.jsonl` (small, fixed
+input; images are embedded as bytes so no separate image files are needed).
+
+---
+
+## Model
+
+The paper applies VL-Calibration on Qwen3-VL-4B-Instruct, Qwen3-VL-8B-Instruct,
+and InternVL3.5-4B-MPO. For the Tier-2 anchor we use the **smallest**,
+`Qwen/Qwen3-VL-4B-Instruct` (vocab `151936`, bf16). The 4B is plenty for a
+16-sample correctness check and kind to a single 3090. An FP8 variant
+(`Qwen/Qwen3-VL-4B-Instruct-FP8`) exists if memory is tight.
+
+**Unverified — confirm before the final Tier-2 run:** the exact image
+**perturbation** the paper uses for the KL (blur vs noise vs masking). Check the
+paper appendix / upstream code and match it in `dump_real_logits.py` (`--perturb`).
+This does NOT affect Tier 1 or the roofline — the kernel computes KL over whatever
+logit pairs it is given.
+
+---
+
+## Project layout
+
+```
+vlcalib_kernel/
+  vc_kernel/
+    ops.py              # vc_eager (baseline) + vc_compile (torch.compile)
+    __init__.py
   scripts/
-    check_env.py
-    check_schema.py
-    download_vl_calibration_cli.sh
-    export_parquet_to_jsonl.py
-    make_debug_subset.py
-    prepare_raw_for_pipeline.py
-    smoke_test_local.sh
-  src/
-  environment.yml
-  environment.lock.yml
-  requirements.lock.txt
-  README.md
+    gen_synthetic.py    # Tier 1: synthetic [T,V] logit pairs
+    dump_real_logits.py # Tier 2: real logits from the VLM
+    check_vocab.py      # read a model's vocab_size from config only
+  data/
+    real/
+      train_32_pipeline.jsonl   # committed input (images embedded as bytes)
+  results/              # gitignored: profiling + benchmark outputs
 ```
 
-## Data Layout
+---
 
-The raw ModelScope dataset contains the following fields:
-
-```text
-problem
-answer
-images
-```
-
-The later VL-Calibration pipeline expects additional fields such as:
-
-```text
-response
-ground_truth
-vision_entropy
-vision_kl
-vision_token_count
-vision_kl_token_count
-```
-
-These extra fields are not present in the raw dataset. They should be produced later by a model generation and visual-certainty computation stage.
-
-The local preprocessing step currently creates placeholder fields so the downstream schema can be debugged before GPU access.
-
-## Environment Setup
-
-Create the conda environment:
+## A. Local setup (CPU, no GPU) — verify structure before the server
 
 ```bash
-conda env create -f environment.yml
-conda activate vl-calib-comp2
+git clone <YOUR_REPO_URL> vlcalib_kernel
+cd vlcalib_kernel
+
+python -m venv .venv && source .venv/bin/activate
+pip install torch pillow                 # CPU torch is fine locally
+
+# Quick synthetic smoke test (tiny shapes, fp32 on CPU)
+python -m scripts.gen_synthetic --T 64 --vocab 2000 --dtype fp32 --out data/synth
+
+# Sanity-check the kernel produces valid entropy/KL
+python -c "import torch; from vc_kernel.ops import vc_eager, reduce_sample; \
+d=torch.load('data/synth/synth_T64_V2000_fp32.pt'); \
+e,k=vc_eager(d['logits_orig'],d['logits_pert']); \
+print('entropy<logV:', bool((e<=torch.log(torch.tensor(2000.))).all()), \
+'| kl>=0:', bool((k>=-1e-4).all()), '| scalars:', reduce_sample(e,k))"
 ```
 
-Check that the environment works:
+Expected: `entropy<logV: True | kl>=0: True | scalars: (...)`.
+
+---
+
+## B. GPU server runbook — follow top to bottom
+
+### B0. Clone and environment
 
 ```bash
-python scripts/check_env.py
+git clone <YOUR_REPO_URL> vlcalib_kernel
+cd vlcalib_kernel
+
+python -m venv .venv && source .venv/bin/activate
+
+# Install the PyTorch build matching the server's CUDA (check `nvidia-smi`).
+# Example for CUDA 12.1:
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# Qwen3-VL needs a recent transformers (>=4.57). triton ships with GPU torch.
+pip install "transformers>=4.57" accelerate pillow torchvision qwen-vl-utils
+
+python -c "import torch; print('cuda', torch.cuda.is_available(), torch.version.cuda)"
 ```
 
-After changing packages, update the lock files:
+### B1. Confirm the model vocab, then generate Tier-1 synthetic data
 
 ```bash
-pip freeze > requirements.lock.txt
-conda env export --no-builds > environment.lock.yml
+# Print the vocab size from config (no weight download):
+python -m scripts.check_vocab --model Qwen/Qwen3-VL-4B-Instruct
+# -> Qwen/Qwen3-VL-4B-Instruct vocab_size = 151936
+
+# Generate the roofline sweep with that vocab, bf16 (matches paper precision):
+python -m scripts.gen_synthetic \
+  --T 256 512 1024 2048 4096 \
+  --vocab 151936 \
+  --dtype bf16 \
+  --seed 0 \
+  --out data/synth
+# Writes data/synth/synth_T{256..4096}_V151936_bf16.pt
 ```
 
-## Dataset Download
+If you switch models, rerun `check_vocab` and pass the new `--vocab`.
 
-The preferred download path is the ModelScope CLI, not `MsDataset.load()`.
-
-The Python `MsDataset.load()` path caused version conflicts between `modelscope` and Hugging Face `datasets`, so this repository uses a CLI-based download script instead.
-
-Run:
+### B2. Dump Tier-2 real logits (start tiny, then scale)
 
 ```bash
-bash scripts/download_vl_calibration_cli.sh
+# Smoke run first — 4 samples, short responses, to confirm the pipeline works:
+python -m scripts.dump_real_logits \
+  --jsonl data/real/train_32_pipeline.jsonl \
+  --model Qwen/Qwen3-VL-4B-Instruct \
+  --n 4 --max-new-tokens 32 --perturb gaussian_blur \
+  --out data/real
+
+# Full anchor set once the smoke run is clean:
+python -m scripts.dump_real_logits \
+  --jsonl data/real/train_32_pipeline.jsonl \
+  --model Qwen/Qwen3-VL-4B-Instruct \
+  --n 16 --max-new-tokens 128 --perturb gaussian_blur \
+  --out data/real
+# Writes data/real/real_000.pt ... real_015.pt
 ```
 
-This downloads the dataset into:
+Memory note: bf16 logits are ~`V * 2` bytes per token (~0.3 MB/token at
+V=151936). Keep `--n` and `--max-new-tokens` modest.
 
-```text
-data/modelscope/VL-Calibration-12K/
-```
-
-Then inspect the downloaded files:
+### B3. Validate the kernel on real logits
 
 ```bash
-find data/modelscope/VL-Calibration-12K -maxdepth 5 -type f | sort
+python -c "import torch,glob; from vc_kernel.ops import vc_eager, reduce_sample; \
+f=sorted(glob.glob('data/real/real_*.pt'))[0]; d=torch.load(f); \
+e,k=vc_eager(d['logits_orig'].cuda(), d['logits_pert'].cuda()); \
+print(f, 'T=',d['T'],'| vision_entropy,vision_kl =', reduce_sample(e,k))"
 ```
 
-If the dataset contains a `train.jsonl`, copy it to the expected raw-data path:
+Sane output = non-negative KL and entropy below `log(V)=~11.93`.
+
+### B4. Benchmark + profile (next files, consume the .pt above)
+
+The benchmark driver and Triton kernel are added separately. They will:
+load `data/synth/*.pt`, time `vc_eager` / `vc_compile` / Triton with warmup +
+CUDA-event timing, verify all three agree numerically, and emit roofline /
+speedup data into `results/`. Profile with:
 
 ```bash
-mkdir -p data/raw/VL-Calibration-12K
-cp path/to/train.jsonl data/raw/VL-Calibration-12K/train.jsonl
+nsys profile -o results/vc_eager  python -m scripts.bench --arm eager  --T 4096
+ncu --set full -o results/vc_triton python -m scripts.bench --arm triton --T 4096
 ```
 
-If the dataset contains a Parquet file instead, convert it:
+---
+
+## Git workflow
+
+### First push (from your machine, after the local smoke test in A)
 
 ```bash
-python scripts/export_parquet_to_jsonl.py \
-  --input path/to/train.parquet \
-  --output data/raw/VL-Calibration-12K/train.jsonl
+cd vlcalib_kernel
+git init
+git add .gitignore README.md vc_kernel/ scripts/ data/real/train_32_pipeline.jsonl
+git status            # confirm NO *.pt and NO data/synth/ are staged
+git commit -m "Visual-certainty kernel scaffold: eager+compile, data generators, runbook"
+git branch -M main
+git remote add origin <YOUR_REPO_URL>
+git push -u origin main
 ```
 
-## Local Smoke Test
+### What is and isn't tracked
 
-After the raw dataset exists at:
+- **Committed:** code (`vc_kernel/`, `scripts/`), `README.md`, `.gitignore`, and the
+  small fixed input `data/real/train_32_pipeline.jsonl`.
+- **Ignored (regenerable / large):** `data/synth/*.pt`, `data/real/*.pt`,
+  `results/`, profiler reports. Reproduce synthetic data from
+  `gen_synthetic.py` + the seed; that command IS the reproducibility contract.
 
-```text
-data/raw/VL-Calibration-12K/train.jsonl
-```
-
-run:
+### On the GPU server
 
 ```bash
-bash scripts/smoke_test_local.sh
+git pull                       # get latest code
+# ... run B1-B4, which write only gitignored artifacts ...
+git add scripts/bench.py vc_kernel/triton_kernel.py   # commit CODE you add
+git commit -m "Add Triton kernel and benchmark driver"
+git push
 ```
 
-The smoke test performs the following steps:
-
-1. Checks the Python environment.
-2. Creates a 32-example debug subset.
-3. Checks the raw dataset schema.
-4. Converts the raw examples into a pipeline-friendly format.
-5. Checks the converted schema.
-6. Confirms that the local pipeline runs end-to-end.
-
-Expected final message:
-
-```text
-Local smoke test passed.
-```
-
-## Current Status
-
-Done:
-
-* Created a reproducible conda environment.
-* Added environment checking script.
-* Added CLI-based ModelScope dataset downloader.
-* Avoided the unstable `MsDataset.load()` path.
-* Added raw dataset schema checker.
-* Added debug subset creation script.
-* Added raw-to-pipeline format conversion script.
-* Added local smoke test script.
-* Confirmed that the local smoke test passes.
-* Committed the working local setup.
-
-## Important Notes
-
-The converted local file may contain fields such as:
-
-```text
-response
-vision_entropy
-vision_kl
-vision_token_count
-vision_kl_token_count
-```
-
-but these are placeholders at the local preprocessing stage.
-
-A field existing in the JSONL file does not mean it contains real model-generated values yet. The real values should be computed later on the GPU server or with a model inference pipeline.
-
-The local machine is used for correctness, structure, and pipeline debugging. The GPU server will be used for model execution, CUDA/PyTorch profiling, benchmarking, and final measurements.
-
-## Reproducing on a GPU Server
-
-On the GPU server:
-
-```bash
-git clone <repo-url>
-cd vl-calib-comp2
-
-conda env create -f environment.yml
-conda activate vl-calib-comp2
-
-bash scripts/download_vl_calibration_cli.sh
-bash scripts/smoke_test_local.sh
-```
-
-If PyTorch/CUDA is needed later, install the correct PyTorch build for the GPU server separately according to the server CUDA version.
-
-## To-Do List
-
-Near-term:
-
-* Inspect `decouple.py` and identify exactly which fields it reads.
-* Decide whether to keep `decouple.py` unchanged and write a preprocessing script, or modify `decouple.py` to accept the raw dataset format.
-* Write a small script that fills `response` using a tiny model or mock response for local debugging.
-* Add validation checks that fail if required fields are missing or still `None` before GPU-only stages.
-* Add a README section explaining each script and its inputs/outputs.
-
-GPU-side:
-
-* Recreate the environment on the GPU server.
-* Install the correct PyTorch/CUDA stack.
-* Run the local smoke test on the GPU server.
-* Run model inference on a small subset.
-* Generate real `response` fields.
-* Compute or approximate visual entropy and visual KL fields.
-* Verify compatibility with `decouple.py`.
-* Add benchmark scripts for timing and profiling.
-* Collect runtime, memory, and profiling results.
-* Save results in `results/`.
-
-Report and presentation:
-
-* Document the full data pipeline.
-* Record exact system configuration.
-* Record package versions and GPU information.
-* Compare baseline and optimized versions.
-* Include runtime and profiling results.
-* Prepare final plots for speedup, bottlenecks, and GPU utilization.
-* Summarize limitations and next steps.
+Never `git add data/synth` or `git add *.pt`. If you accidentally stage one:
+`git restore --staged path/to/file.pt`.
