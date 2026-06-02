@@ -5,11 +5,8 @@ __pycache__/
 .envrc
 
 data/raw/
-data/processed/
 data/modelscope/
 data/debug/
-data/synth/
-data/real/
 results/
 *.pt
 results/
