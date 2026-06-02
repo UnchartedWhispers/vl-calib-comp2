@@ -52,7 +52,7 @@ produced by us, in two tiers:
   logits. Proves the kernel gives sane entropy/KL on real data. GPU + weights
   required. Large → **not committed to git**.
 
-The only data file committed is `data/real/train_32_pipeline.jsonl` (small, fixed
+The only data file committed is `data/processed/train_32_pipeline.jsonl` (small, fixed
 input; images are embedded as bytes so no separate image files are needed).
 
 ---
