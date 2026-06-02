@@ -9,7 +9,7 @@ dependencies:
   - pyarrow
   - tqdm
   - pyyaml
-  - matplotlib
+  - matplotlib          # roofline / speedup plots from results/roofline.json
   - scikit-learn
   - pillow
   - pip:
@@ -19,3 +19,19 @@ dependencies:
       - safetensors
       - jsonlines
       - addict
+      # ---------------------------------------------------------------------
+      # torch + triton are intentionally NOT pinned here.
+      # The correct build depends on the target machine's CUDA version, so
+      # install them AFTER creating this env, per README step B0:
+      #
+      #   GPU server (example, CUDA 12.1):
+      #     pip install torch --index-url https://download.pytorch.org/whl/cu121
+      #     # triton ships inside the GPU torch wheel; verify:
+      #     python -c "import triton; print(triton.__version__)"
+      #
+      #   Local CPU-only (structure checks; triton arm auto-skips):
+      #     pip install torch
+      #
+      # All three benchmark arms (eager / compile / triton) require torch;
+      # the triton arm additionally requires a CUDA GPU.
+      # ---------------------------------------------------------------------

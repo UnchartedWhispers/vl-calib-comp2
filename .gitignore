@@ -1,18 +1,34 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Environments
 .env
 .venv/
 .envrc
 
+# Generated / large data — regenerated on demand, never committed
+# (the only tracked data file is data/processed/train_32_pipeline.jsonl)
 data/raw/
 data/modelscope/
 data/debug/
-results/
+data/synth/
+data/real/
 *.pt
+
+# Benchmark + profiler outputs
 results/
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+
+# Logs / checkpoints / weights
 logs/
+*.log
 checkpoints/
 models/
 
-*.log
+# OS
 .DS_Store
