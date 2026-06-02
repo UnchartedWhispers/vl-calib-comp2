@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+.envrc
+
+data/raw/
+data/processed/
+data/modelscope/
+data/debug/
+results/
+logs/
+checkpoints/
+models/
+
+*.log
+.DS_Store

@@ -1,0 +1,21 @@
+name: vl-calib-comp2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - pyarrow
+  - tqdm
+  - pyyaml
+  - matplotlib
+  - scikit-learn
+  - pillow
+  - pip:
+      - modelscope==1.37.1
+      - transformers
+      - accelerate
+      - safetensors
+      - jsonlines
+      - addict
